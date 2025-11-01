@@ -40,7 +40,8 @@ func normalizeSlot(s string) string {
 }
 
 type Outfit struct {
-	BySlot map[string]string // 槽位 -> 装备名
+	BySlot       map[string]string // 槽位 -> 装备名
+	SpecialItems map[string]int    // 特殊物品 -> 数量
 }
 
 // 计算一个区服的目标 8 件套（两阶段）
@@ -77,7 +78,7 @@ func PlanZone(zone string) map[string]Outfit {
 		for _, name := range a.Items {
 			placeIntoSlots(m, name)
 		}
-		res[a.RoleName] = Outfit{BySlot: m}
+		res[a.RoleName] = Outfit{BySlot: m, SpecialItems: make(map[string]int)}
 	}
 
 	// 第二阶段：按推荐搭配方案补全 8 件，避免相同戒指/手镯重复
@@ -145,6 +146,53 @@ func guessSlotByName(name string) string {
 	}
 }
 
+// 组合评分函数，评估组合的强度
+func scoreCombo(combo []string, out Outfit, pool []PoolItem, stg Strategy) int {
+	score := 0
+	
+	// 计算每个槽位的装备分数
+	for slot, item := range out.BySlot {
+		if item == "" {
+			continue
+		}
+		// 查找装备所属的套装
+		for setName, pieces := range EquipmentSets {
+			if _, exists := pieces[item]; exists {
+				// 套装强度加上装备评分
+				score += EquipmentRank[setName] * 10
+				// 对于主要装备槽位给予额外加分
+				if slot == "头" || slot == "项链" || slot == "腰带" || slot == "鞋子" {
+					score += 50
+				}
+				break
+			}
+		}
+	}
+	
+	// 检查是否有轩辕之心
+	if out.SpecialItems[XuanYuanHeart] > 0 {
+		score += 1000 // 轩辕之心给予很高的加分
+	}
+	
+	// 检查套装件数（4件套装额外加分）
+	for setName, pieces := range EquipmentSets {
+		count := 0
+		for item := range pieces {
+			for _, i := range out.BySlot {
+				if i == item {
+					count++
+					break
+				}
+			}
+		}
+		if count >= 4 {
+			score += EquipmentRank[setName] * 5 // 4件套装额外加分
+		}
+	}
+	
+	return score
+}
+
 // 根据职业与推荐方案补全到 8 件
 func fillToEight(out *Outfit, ra t.RoleAttributes, pool *[]PoolItem) {
 	need := missingSlots(out.BySlot)
@@ -152,9 +200,41 @@ func fillToEight(out *Outfit, ra t.RoleAttributes, pool *[]PoolItem) {
 		return
 	}
 	stg := Strategies[ra.Class]
-	// 解析推荐组合，选择第一条可满足的组合做贪心填充
+	
+	// 查找4件套的套装名称
+	var fourPieceSet string
+	for _, item := range out.BySlot {
+		if item == "" {
+			continue
+		}
+		for setName, items := range EquipmentSets {
+			if _, exists := items[item]; exists {
+				// 统计该套装在当前装备中的数量
+				count := 0
+				for _, i := range out.BySlot {
+					if i == "" {
+						continue
+					}
+					if _, e := items[i]; e {
+						count++
+					}
+				}
+				if count >= 4 {
+					fourPieceSet = setName
+					break
+				}
+			}
+		if fourPieceSet != "" {
+			break
+		}
+	}
+
+	// 按顺序尝试推荐组合，找到第一个满足条件的就应用
 	for _, combo := range stg.Combos {
-		mCopy := cloneMap(out.BySlot)
+		outCopy := Outfit{BySlot: cloneMap(out.BySlot), SpecialItems: make(map[string]int)}
+		for k, v := range out.SpecialItems {
+			outCopy.SpecialItems[k] = v
+		}
 		poolCopy := clonePool(*pool)
 		ok := true
 	ComboLoop:
@@ -162,8 +242,15 @@ func fillToEight(out *Outfit, ra t.RoleAttributes, pool *[]PoolItem) {
 			switch seg {
 			case "4主体":
 				// 已经尽量满足，不再强行替换
-			case "3主体", "2主体", "1主体", "4其他主体", "2其他主体", "3天机", "3天机/疾风", "3疾风", "2祝福", "1轩辕之心":
-				if !applySegment(&mCopy, seg, stg, &poolCopy) {
+			case "3主体", "2主体", "1主体", "4其他主体", "2其他主体", "3天机", "3天机/疾风", "3疾风", "2祝福":
+				if !applySegment(&outCopy, seg, stg, &poolCopy, fourPieceSet) {
+					ok = false
+					break ComboLoop
+				}
+			case "1轩辕之心":
+				if takeFromPoolExact(&poolCopy, XuanYuanHeart) {
+					outCopy.SpecialItems[XuanYuanHeart] = 1
+				} else {
 					ok = false
 					break ComboLoop
 				}
@@ -173,23 +260,137 @@ func fillToEight(out *Outfit, ra t.RoleAttributes, pool *[]PoolItem) {
 		}
 		if ok {
 			// 校验戒指/手镯不重复名
-			if !validNoDuplicatePair(mCopy["戒指1"], mCopy["戒指2"]) {
+			if !validNoDuplicatePair(outCopy.BySlot["戒指1"], outCopy.BySlot["戒指2"]) {
 				continue
 			}
-			if !validNoDuplicatePair(mCopy["手镯1"], mCopy["手镯2"]) {
+			if !validNoDuplicatePair(outCopy.BySlot["手镯1"], outCopy.BySlot["手镯2"]) {
 				continue
 			}
-			out.BySlot = mCopy
+			
+			// 应用找到的第一个可行组合
+			out.BySlot = outCopy.BySlot
+			out.SpecialItems = outCopy.SpecialItems
 			*pool = poolCopy
 			return
 		}
 	}
-	// 若没有组合成功，直接用可用的不同件补齐
+
+	// 若没有组合成功，尝试分配两件套
+if len(need) >= 2 {
+		// 查找可用的两件套
+		for _, setName := range stg.Pri2 {
+			pieces := EquipmentSets[setName]
+			if pieces == nil {
+				continue
+			}
+
+			// 检查该套装是否已经被使用（排除4件套）
+			if setName != fourPieceSet {
+				usedSets := getUsedSets(out, fourPieceSet)
+				if usedSets[setName] {
+					continue
+				}
+			}
+			
+			// 尝试从该套装取2件
+			picked := []string{}
+			for item := range pieces {
+				if len(picked) >= 2 {
+					break
+				}
+				slot := guessSlotByName(item)
+				if slot == "" {
+					continue
+				}
+				
+				// 检查该槽位是否需要装备
+				found := false
+				for _, s := range need {
+					if s == slot || s == slot+"1" || s == slot+"2" {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+				
+				// 检查装备是否可用
+				if !takeFromPoolExact(pool, item) {
+					continue
+				}
+				
+				// 放入合适的槽位
+				if slot == "手镯" || slot == "戒指" {
+					// 处理双槽位装备
+					if out.BySlot[slot+"1"] == "" {
+						out.BySlot[slot+"1"] = item
+					} else if out.BySlot[slot+"2"] == "" && out.BySlot[slot+"1"] != item {
+						out.BySlot[slot+"2"] = item
+					} else {
+						// 无法放入槽位，将装备放回装备池
+						returnToPool(pool, item)
+						continue
+					}
+				} else {
+					// 处理单槽位装备
+					out.BySlot[slot] = item
+				}
+				
+				picked = append(picked, item)
+			}
+			
+			if len(picked) >= 2 {
+				// 成功分配两件套
+				return
+			}
+			
+			// 回滚已拿的件
+			for _, it := range picked {
+				returnToPool(pool, it)
+			}
+		}
+	}
+
+	// 若没有两件套可用，直接用可用的不同件补齐
 	for _, s := range slotOrder {
 		if out.BySlot[s] == "" {
-			name := takeAnyFitting(pool, s, out.BySlot)
-			if name != "" {
-				out.BySlot[s] = name
+			// 获取当前已经使用的套装（排除4件套）
+			usedSets := getUsedSets(out, fourPieceSet)
+			// 找到适合该槽位且不重复套装的装备
+			var selectedItem string
+			for i := range *pool {
+				item := (*pool)[i]
+				if item.Count <= 0 {
+					continue
+				}
+				// 检查装备是否适合该槽位
+				if !isItemFitting(item.Name, s, out.BySlot) {
+					continue
+				}
+				// 检查装备是否属于已知套装
+				isKnown := false
+				var itemSet string
+				for setName, items := range EquipmentSets {
+					if _, exists := items[item.Name]; exists {
+						isKnown = true
+						itemSet = setName
+						break
+					}
+				}
+				// 未知装备不参与分配
+				if !isKnown {
+					continue
+				}
+				// 检查套装是否已经被使用（排除4件套）
+				if itemSet != fourPieceSet && !usedSets[itemSet] {
+					selectedItem = item.Name
+					(*pool)[i].Count--
+					break
+				}
+			}
+			if selectedItem != "" {
+				out.BySlot[s] = selectedItem
 			}
 		}
 	}
@@ -220,8 +421,8 @@ func clonePool(src []PoolItem) []PoolItem {
 
 func validNoDuplicatePair(a, b string) bool { return a == "" || b == "" || a != b }
 
-func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolItem) bool {
-	s := *m
+func applySegment(out *Outfit, seg string, stg Strategy, pool *[]PoolItem, fourPieceSet string) bool {
+	s := out.BySlot
 	// 选择套装来源：主体优先使用 Pri2/Pri1/或指定的“祝福/天机/疾风”等
 	srcSets := []string{}
 	switch seg {
@@ -242,11 +443,11 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 	case "2祝福":
 		srcSets = []string{"祝福套"}
 	case "1轩辕之心":
-		// 特殊不占 8 槽，忽略占位，仅从池内减少一件（如果有）
 		if takeFromPoolExact(pool, XuanYuanHeart) {
+			out.SpecialItems[XuanYuanHeart] = 1
 			return true
 		}
-		return true
+		return false
 	default:
 		return true
 	}
@@ -256,6 +457,15 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 		if pieces == nil {
 			continue
 		}
+
+		// 检查该套装是否已经被使用（排除4件套）
+		if setName != fourPieceSet {
+			usedSets := getUsedSets(out, fourPieceSet)
+			if usedSets[setName] {
+				continue
+			}
+		}
+		
 		// 从该套装尝试取 need 件，且不与现有冲突，并遵守手镯/戒指双件不重复
 		picked := []string{}
 		for item := range pieces {
@@ -279,6 +489,8 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 				} else if s["手镯2"] == "" && s["手镯1"] != item {
 					s["手镯2"] = item
 				} else {
+					// 无法放入槽位，将装备放回装备池
+					returnToPool(pool, item)
 					continue
 				}
 				picked = append(picked, item)
@@ -299,6 +511,8 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 				} else if s["戒指2"] == "" && s["戒指1"] != item {
 					s["戒指2"] = item
 				} else {
+					// 无法放入槽位，将装备放回装备池
+					returnToPool(pool, item)
 					continue
 				}
 				picked = append(picked, item)
@@ -319,7 +533,6 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 			picked = append(picked, item)
 		}
 		if len(picked) >= need {
-			*m = s
 			return true
 		}
 		// 回滚已拿的件
@@ -328,6 +541,51 @@ func applySegment(m *map[string]string, seg string, stg Strategy, pool *[]PoolIt
 		}
 	}
 	return false
+}
+
+// 获取当前已经使用的套装（排除指定套装）
+func getUsedSets(out *Outfit, excludeSet string) map[string]bool {
+	usedSets := make(map[string]bool)
+	for _, item := range out.BySlot {
+		if item == "" {
+			continue
+		}
+		// 查找装备所属的套装
+		for setName, items := range EquipmentSets {
+			if _, exists := items[item]; exists {
+				if setName != excludeSet {
+					usedSets[setName] = true
+				}
+				break
+			}
+		}
+	}
+	return usedSets
+}
+
+// 检查装备是否适合某个槽位
+func isItemFitting(itemName, slot string, current map[string]string) bool {
+	s := guessSlotByName(itemName)
+	if slot == "手镯1" || slot == "手镯2" {
+		if s != "手镯" {
+			return false
+		}
+	}
+	if slot == "戒指1" || slot == "戒指2" {
+		if s != "戒指" {
+			return false
+		}
+	}
+	if slot == "头" || slot == "项链" || slot == "腰带" || slot == "鞋子" {
+		if s != slot {
+			return false
+		}
+	}
+	// 避免相同对
+	if (slot == "手镯2" && current["手镯1"] == itemName) || (slot == "戒指2" && current["戒指1"] == itemName) {
+		return false
+	}
+	return true
 }
 
 func allSetsExcept(ref []string) []string {

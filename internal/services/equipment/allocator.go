@@ -38,45 +38,85 @@ func BuildPool(roles []t.RoleAttributes) []PoolItem {
 	return pool
 }
 
-// Greedy: ensure each role gets a 4-piece main set if possible
-func EnsureFourPiece(roles []t.RoleAttributes, pool []PoolItem) []Allocation {
-	// order roles: priority 天尊流派其次道术
+// 统计每个套装的可用4件套数量
+func countSetFourPieceAvailability(pool []PoolItem) map[string]int {
+	availability := make(map[string]int)
+	
+	// 统计每个套装的可用装备数量
+	setItemCount := make(map[string]int)
+	for _, p := range pool {
+		for setName, items := range EquipmentSets {
+			if _, exists := items[p.Name]; exists {
+				setItemCount[setName]++
+				break
+			}
+		}
+	}
+	
+	// 计算每个套装的可用4件套数量（最多为可用装备数量除以4，向下取整）
+	for setName, count := range setItemCount {
+		availability[setName] = count / 4
+	}
+	
+	return availability
+}
+
+// 按角色等级和道术排序角色
+func sortRolesByLevelAndMagic(roles []t.RoleAttributes) {
 	sort.SliceStable(roles, func(i, j int) bool {
-		pi := 0
-		pj := 0
-		if roles[i].School == "天尊" {
-			pi += 1000
+		// 优先按等级排序
+		if roles[i].Level != roles[j].Level {
+			return roles[i].Level > roles[j].Level
 		}
-		if roles[j].School == "天尊" {
-			pj += 1000
-		}
+		// 等级相同按道术排序
 		if roles[i].Magic != roles[j].Magic {
 			return roles[i].Magic > roles[j].Magic
 		}
-		return pi > pj
+		// 道术相同按角色名排序
+		return roles[i].RoleName < roles[j].RoleName
 	})
+}
+
+// EnsureFourPiece 尝试为每个角色分配4件套主套装
+func EnsureFourPiece(roles []t.RoleAttributes, pool []PoolItem) []Allocation {
+	// 按角色等级和道术排序
+	sortRolesByLevelAndMagic(roles)
 
 	allocs := make([]Allocation, 0, len(roles))
-	// very simplified matching: find best-ranked set with >=4 distinct slots available
+	// 统计每个套装的可用4件套数量
+	setAvailability := countSetFourPieceAvailability(pool)
+
+	// 遍历每个角色，为他们分配最强的可用4件套
 	for _, r := range roles {
 		bestSet := ""
 		bestRank := -1
-		for set, pieces := range EquipmentSets {
-			if rank := EquipmentRank[set]; rank > bestRank {
-				if countAvailable(pieces, pool) >= 4 {
-					bestSet = set
-					bestRank = rank
-				}
+		
+		// 找到最强的可用4件套
+		for setName, count := range setAvailability {
+			if count <= 0 {
+				continue
+			}
+			
+			rank := EquipmentRank[setName]
+			if rank > bestRank {
+				bestSet = setName
+				bestRank = rank
 			}
 		}
+		
 		if bestSet == "" {
 			allocs = append(allocs, Allocation{RoleName: r.RoleName})
 			continue
 		}
-		// take 4 distinct piece names
+		
+		// 从装备池中取出4件该套装的装备
 		items := takePieces(EquipmentSets[bestSet], 4, &pool)
 		allocs = append(allocs, Allocation{RoleName: r.RoleName, Items: items})
+		
+		// 更新套装可用性
+		setAvailability[bestSet]--
 	}
+	
 	return allocs
 }
 
